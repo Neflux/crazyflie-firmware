@@ -37,6 +37,10 @@
 
 #include "led.h"
 
+#include "param.h"
+#include "log.h"
+#include "debug.h"
+
 #ifdef CALIBRATED_LED_MORSE
 #define DOT 100
 #define DASH (3 * DOT)
@@ -196,6 +200,9 @@ static bool isInit = false;
 static bool ledseqEnabled = false;
 
 static void lesdeqCmdTask(void *param);
+
+
+static uint8_t debug = 0;
 
 void ledseqInit() {
     if (isInit) {
@@ -407,3 +414,11 @@ static void updateActive(led_t led) {
         }
     }
 }
+
+PARAM_GROUP_START(led3)
+PARAM_ADD(PARAM_UINT8, Debug, &debug)
+//PARAM_ADD(PARAM_FLOAT, BlinkFrequency, &led_blink_frequency)
+//PARAM_ADD(PARAM_UINT8, SamplesPerSignal, &samples_per_signal)
+//PARAM_ADD(PARAM_UINT8, payload, &payload)
+//PARAM_ADD(PARAM_UINT8, payload_len, &payload_len)
+PARAM_GROUP_STOP(led3)
