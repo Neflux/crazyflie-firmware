@@ -39,7 +39,15 @@
 
 #include "param.h"
 #include "log.h"
+
+#define DEBUG_MODE
+
+#ifdef DEBUG_MODE // for some reason, this makes the PARAMs un-editable from cfclient
 #include "debug.h"
+#else
+static uint8_t compiler = 0;
+#define DEBUG_PRINT(fmt, ...) (compiler = 1-compiler)
+#endif
 
 #ifdef CALIBRATED_LED_MORSE
 #define DOT 100
@@ -183,7 +191,7 @@ struct ledseqCmd_s {
 /* Led sequence handling machine implementation */
 static void runLedseq(xTimerHandle xTimer);
 
-static void updateActive(led_t led);
+//static void updateActive(led_t led);
 
 NO_DMA_CCM_SAFE_ZERO_INIT static ledseqContext_t
 * activeSeq[LED_NUM];
@@ -203,6 +211,29 @@ static void lesdeqCmdTask(void *param);
 
 
 static uint8_t debug = 0;
+static float led_blink_frequency = 34;
+static uint8_t samples_per_signal = 12;
+static float old_sps, old_lbf;
+
+
+enum emission_state {
+    EMISSION_IDLE = 1,
+    EMISSION_START = 2,
+    EMISSION_PAYLOAD = 4,
+    EMISSION_END = 8,
+};
+static uint8_t current_emission_state, current_led_value, payload_len, payload, payload_progress_counter, idle_left;
+
+#define IDLE_BITS   2
+
+void setLeds(uint8_t val) {
+    ledSet(LED_RED_R, val);
+    ledSet(LED_RED_L, val);
+    ledSet(LED_GREEN_L, val);
+    ledSet(LED_GREEN_R, val);
+    ledSet(LED_BLUE_L, val);
+//    ledSet(LED_BLUE_R, val);
+}
 
 void ledseqInit() {
     if (isInit) {
@@ -219,7 +250,6 @@ void ledseqInit() {
     ledseqRegisterSequence(&seq_charging);
     ledseqRegisterSequence(&seq_calibrated);
     ledseqRegisterSequence(&seq_alive);
-    ledseqRegisterSequence(&seq_linkUp);
     ledseqRegisterSequence(&seq_linkDown);
 
     //Initialise the sequences state
@@ -228,9 +258,24 @@ void ledseqInit() {
     }
 
     //Init the soft timers that runs the led sequences for each leds
-    for (int i = 0; i < LED_NUM; i++) {
-        timer[i] = xTimerCreateStatic("ledseqTimer", M2T(1000), pdFALSE, (void *) i, runLedseq, &timerBuffer[i]);
-    }
+//    for (int i = 0; i < LED_NUM; i++) {
+//        timer[i] = xTimerCreateStatic("ledseqTimer", M2T(1000), pdFALSE, (void *) i, runLedseq, &timerBuffer[i]);
+//    }
+    old_sps = samples_per_signal;
+    old_lbf = led_blink_frequency;
+    current_emission_state = EMISSION_IDLE;
+    current_led_value = 1;
+    payload_len = 4;
+    idle_left = IDLE_BITS;
+    payload = 10;
+    payload_progress_counter = 0;
+
+    DEBUG_PRINT("Emission loop started\n");
+    timer[0] = xTimerCreateStatic("ledseqTimer", M2T(1000.0f * samples_per_signal / led_blink_frequency),
+                                  pdTRUE, 0, runLedseq,
+                                  &timerBuffer[0]);
+    xTimerStart(timer[0], M2T(500));
+
 
     ledseqMutex = xSemaphoreCreateMutex();
 
@@ -238,7 +283,65 @@ void ledseqInit() {
     xTaskCreate(lesdeqCmdTask, LEDSEQCMD_TASK_NAME, LEDSEQCMD_TASK_STACKSIZE, NULL, LEDSEQCMD_TASK_PRI, NULL);
 
     isInit = true;
+
+
 }
+
+#define MIN(a, b) (((a)<(b))?(a):(b))
+#define MAX(a, b) (((a)>(b))?(a):(b))
+static void runLedseq(xTimerHandle xTimer) {
+
+    if (!ledseqEnabled) {
+        return;
+    }
+
+    if (debug){
+        DEBUG_PRINT("Debug");
+        current_led_value = 1 - current_led_value;
+    }
+    else switch(current_emission_state){
+        case EMISSION_IDLE:
+            DEBUG_PRINT("Idle");
+            if (--idle_left <= 0){
+                idle_left = IDLE_BITS;
+                current_emission_state = EMISSION_START;
+            }
+            current_led_value = 1;
+            break;
+        case EMISSION_START:
+            DEBUG_PRINT("Start");
+            current_led_value = 0;
+            current_emission_state = EMISSION_PAYLOAD;
+            break;
+        case EMISSION_PAYLOAD:
+            DEBUG_PRINT("Payload (%d)", payload_progress_counter);
+            current_led_value = (payload >> (payload_len - payload_progress_counter - 1)) & 1;
+            payload_progress_counter++;
+            if (payload_progress_counter >= MIN(MAX(payload_len, 1), 8)) {
+                payload_progress_counter = 0;
+                current_emission_state = EMISSION_END;
+            }
+            break;
+        case EMISSION_END:
+            DEBUG_PRINT("End");
+            current_led_value = 1;
+            current_emission_state = EMISSION_IDLE;
+            break;
+    }
+    DEBUG_PRINT(": %d\n", current_led_value);
+    setLeds(current_led_value);
+
+    if ((old_sps != samples_per_signal) || (old_lbf != led_blink_frequency)) {
+
+        DEBUG_PRINT("Changing period to %d\n", M2T(1000.0f * samples_per_signal / led_blink_frequency));
+
+        xTimerChangePeriod(xTimer, M2T(1000.0f * samples_per_signal / led_blink_frequency), M2T(1000));
+
+        old_sps = samples_per_signal;
+        old_lbf = led_blink_frequency;
+    }
+}
+
 
 static void lesdeqCmdTask(void *param) {
     struct ledseqCmd_s command;
@@ -285,17 +388,17 @@ bool ledseqRun(ledseqContext_t *context) {
 }
 
 void ledseqRunBlocking(ledseqContext_t *context) {
-    const led_t led = context->led;
-
-    xSemaphoreTake(ledseqMutex, portMAX_DELAY);
-    context->state = 0;  //Reset the seq. to its first step
-    updateActive(led);
-    xSemaphoreGive(ledseqMutex);
-
-    // Run the first step if the new seq is the active sequence
-    if (activeSeq[led] == context) {
-        runLedseq(timer[led]);
-    }
+//    const led_t led = context->led;
+//
+//    xSemaphoreTake(ledseqMutex, portMAX_DELAY);
+//    context->state = 0;  //Reset the seq. to its first step
+//    updateActive(led);
+//    xSemaphoreGive(ledseqMutex);
+//
+//    // Run the first step if the new seq is the active sequence
+//    if (activeSeq[led] == context) {
+//        runLedseq(timer[led]);
+//    }
 }
 
 void ledseqSetChargeLevel(const float chargeLevel) {
@@ -317,63 +420,15 @@ bool ledseqStop(ledseqContext_t *context) {
 }
 
 void ledseqStopBlocking(ledseqContext_t *context) {
-    const led_t led = context->led;
-
-    xSemaphoreTake(ledseqMutex, portMAX_DELAY);
-    context->state = LEDSEQ_STOP;  //Stop the seq.
-    updateActive(led);
-    xSemaphoreGive(ledseqMutex);
-
-    //Run the next active sequence (if any...)
-    runLedseq(timer[led]);
-}
-
-/* Center of the led sequence machine. This function is executed by the FreeRTOS
- * timers and runs the sequences
- */
-static void runLedseq(xTimerHandle xTimer) {
-    if (!ledseqEnabled) {
-        return;
-    }
-
-    led_t led = (led_t) pvTimerGetTimerID(xTimer);
-    ledseqContext_t * context = activeSeq[led];
-    if (NO_CONTEXT == context) {
-        return;
-    }
-
-    bool leave = false;
-    while (!leave) {
-        if (context->state == LEDSEQ_STOP) {
-            return;
-        }
-
-        const ledseqStep_t *step = &context->sequence[context->state];
-
-        xSemaphoreTake(ledseqMutex, portMAX_DELAY);
-        context->state++;
-        led_t led = context->led;
-
-        switch (step->action) {
-            case LEDSEQ_LOOP:
-                context->state = 0;
-                break;
-            case LEDSEQ_STOP:
-                context->state = LEDSEQ_STOP;
-                updateActive(led);
-                break;
-            default:  //The step is a LED action and a time
-                ledSet(led, step->value);
-                if (step->action == 0) {
-                    break;
-                }
-                xTimerChangePeriod(xTimer, M2T(step->action), 0);
-                xTimerStart(xTimer, 0);
-                leave = true;
-                break;
-        }
-        xSemaphoreGive(ledseqMutex);
-    }
+//    const led_t led = context->led;
+//
+//    xSemaphoreTake(ledseqMutex, portMAX_DELAY);
+//    context->state = LEDSEQ_STOP;  //Stop the seq.
+//    updateActive(led);
+//    xSemaphoreGive(ledseqMutex);
+//
+//    //Run the next active sequence (if any...)
+//    runLedseq(timer[led]);
 }
 
 void ledseqRegisterSequence(ledseqContext_t *context) {
@@ -403,22 +458,23 @@ void ledseqRegisterSequence(ledseqContext_t *context) {
 
 // Utility functions
 
-static void updateActive(led_t led) {
-    activeSeq[led] = NO_CONTEXT;
-    ledSet(led, false);
-
-    for (ledseqContext_t *sequence = sequences; sequence != 0; sequence = sequence->nextContext) {
-        if (sequence->led == led && sequence->state != LEDSEQ_STOP) {
-            activeSeq[led] = sequence;
-            break;
-        }
-    }
-}
-
+//static void updateActive(led_t led) {
+//    activeSeq[led] = NO_CONTEXT;
+//    ledSet(led, false);
+//
+//    for (ledseqContext_t *sequence = sequences; sequence != 0; sequence = sequence->nextContext) {
+//        if (sequence->led == led && sequence->state != LEDSEQ_STOP) {
+//            activeSeq[led] = sequence;
+//            break;
+//        }
+//    }
+//}
+//#ifndef DEBUG_MODE
 PARAM_GROUP_START(led3)
-PARAM_ADD(PARAM_UINT8, Debug, &debug)
-//PARAM_ADD(PARAM_FLOAT, BlinkFrequency, &led_blink_frequency)
-//PARAM_ADD(PARAM_UINT8, SamplesPerSignal, &samples_per_signal)
-//PARAM_ADD(PARAM_UINT8, payload, &payload)
-//PARAM_ADD(PARAM_UINT8, payload_len, &payload_len)
+PARAM_ADD(PARAM_UINT8, Debug,&debug)
+PARAM_ADD(PARAM_FLOAT, BlinkFrequency, &led_blink_frequency)
+PARAM_ADD(PARAM_UINT8, SamplesPerSignal, &samples_per_signal)
+PARAM_ADD(PARAM_UINT8, payload, &payload)
+PARAM_ADD(PARAM_UINT8, payload_len, &payload_len)
 PARAM_GROUP_STOP(led3)
+//#endif
