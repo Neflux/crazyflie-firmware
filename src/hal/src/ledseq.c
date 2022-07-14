@@ -210,9 +210,9 @@ static bool ledseqEnabled = false;
 static void lesdeqCmdTask(void *param);
 
 
-static uint8_t debug = 0;
-static float led_blink_frequency = 34;
-static uint8_t samples_per_signal = 12;
+static uint8_t emission_mode = 0;
+static float led_blink_frequency = 34.74;
+static uint8_t samples_per_signal = 8;
 static float old_sps, old_lbf;
 
 
@@ -222,9 +222,9 @@ enum emission_state {
     EMISSION_PAYLOAD = 4,
     EMISSION_END = 8,
 };
-static uint8_t current_emission_state, current_led_value, payload_len, payload, payload_progress_counter, idle_left;
+static uint8_t current_emission_state, current_led_value, payload_len, payload, active_payload, payload_progress_counter,
+idle_left, stop_bits_left, idle_bits, stop_bits;
 
-#define IDLE_BITS   2
 
 void setLeds(uint8_t val) {
     ledSet(LED_RED_R, val);
@@ -265,9 +265,12 @@ void ledseqInit() {
     old_lbf = led_blink_frequency;
     current_emission_state = EMISSION_IDLE;
     current_led_value = 1;
-    payload_len = 4;
-    idle_left = IDLE_BITS;
-    payload = 10;
+    payload_len = 8;
+    idle_bits = 1;
+    idle_left = idle_bits;
+    stop_bits = 1;
+    stop_bits_left = stop_bits * 2;
+    payload = active_payload = 85;
     payload_progress_counter = 0;
 
     DEBUG_PRINT("Emission loop started\n");
@@ -295,15 +298,21 @@ static void runLedseq(xTimerHandle xTimer) {
         return;
     }
 
-    if (debug){
-        DEBUG_PRINT("Debug");
-        current_led_value = 1 - current_led_value;
+    if (emission_mode > 2){
+        emission_mode = 0;
     }
-    else switch(current_emission_state){
+
+    if (emission_mode != 1){
+        DEBUG_PRINT((emission_mode==0)?"Idle":"Debug");
+        current_led_value = (emission_mode==0)?(1):(1 - current_led_value);
+        current_emission_state = EMISSION_IDLE;
+        idle_left = idle_bits;
+        payload_progress_counter = 0;
+    }
+    else switch(current_emission_state){ //emission_mode = 1
         case EMISSION_IDLE:
             DEBUG_PRINT("Idle");
             if (--idle_left <= 0){
-                idle_left = IDLE_BITS;
                 current_emission_state = EMISSION_START;
             }
             current_led_value = 1;
@@ -312,20 +321,26 @@ static void runLedseq(xTimerHandle xTimer) {
             DEBUG_PRINT("Start");
             current_led_value = 0;
             current_emission_state = EMISSION_PAYLOAD;
+            if (payload != active_payload)
+                active_payload = payload;
             break;
         case EMISSION_PAYLOAD:
             DEBUG_PRINT("Payload (%d)", payload_progress_counter);
-            current_led_value = (payload >> (payload_len - payload_progress_counter - 1)) & 1;
+            current_led_value = (active_payload >> (payload_len - payload_progress_counter - 1)) & 1;
             payload_progress_counter++;
             if (payload_progress_counter >= MIN(MAX(payload_len, 1), 8)) {
                 payload_progress_counter = 0;
                 current_emission_state = EMISSION_END;
+                stop_bits_left = stop_bits * 2;
             }
             break;
         case EMISSION_END:
-            DEBUG_PRINT("End");
-            current_led_value = 1;
-            current_emission_state = EMISSION_IDLE;
+            DEBUG_PRINT("Stop bit");
+            current_led_value = (stop_bits_left-- % 2) == 0;
+            if (stop_bits_left == 0) {
+                current_emission_state = EMISSION_IDLE;
+                idle_left = idle_bits;
+            }
             break;
     }
     DEBUG_PRINT(": %d\n", current_led_value);
@@ -471,10 +486,12 @@ void ledseqRegisterSequence(ledseqContext_t *context) {
 //}
 //#ifndef DEBUG_MODE
 PARAM_GROUP_START(led3)
-PARAM_ADD(PARAM_UINT8, Debug,&debug)
-PARAM_ADD(PARAM_FLOAT, BlinkFrequency, &led_blink_frequency)
-PARAM_ADD(PARAM_UINT8, SamplesPerSignal, &samples_per_signal)
-PARAM_ADD(PARAM_UINT8, payload, &payload)
-PARAM_ADD(PARAM_UINT8, payload_len, &payload_len)
+PARAM_ADD(PARAM_UINT8, emissionMode,&emission_mode)
+PARAM_ADD(PARAM_FLOAT, blinkFrequency, &led_blink_frequency)
+PARAM_ADD(PARAM_UINT8, samplesPerSignal, &samples_per_signal)
+PARAM_ADD(PARAM_UINT8, payloadInteger, &payload)
+PARAM_ADD(PARAM_UINT8, payloadLength, &payload_len)
+PARAM_ADD(PARAM_UINT8, idleBits, &idle_bits)
+PARAM_ADD(PARAM_UINT8, stopBits, &stop_bits)
 PARAM_GROUP_STOP(led3)
 //#endif
